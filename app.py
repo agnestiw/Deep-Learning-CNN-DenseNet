@@ -1,299 +1,416 @@
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-from tensorflow.keras.applications import DenseNet121
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, classification_report
-from sklearn.preprocessing import label_binarize
-import numpy as np
-import time
 import os
+import glob
+import time
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-# --- 1. KONFIGURASI ---
-# GANTI INI: Sesuaikan dengan path ke folder dataset Anda
-# Struktur folder yang diharapkan:
-# /path/ke/dataset/
-#   |- class_A/
-#   |   |- img1.jpg
-#   |   |- img2.jpg
-#   ...
-#   |- class_B/
-#   |   |- img100.jpg
-#   ...
-DATASET_DIR = "./dataset_padang_food"
-
-IMG_SIZE = (224, 224)  # Ukuran input standar untuk DenseNet
-BATCH_SIZE = 32
-EPOCHS = 10  # Ganti sesuai kebutuhan
-
-# --- 2. MEMUAT DATASET & MEMBUAT SPLIT 80/20 ---
-# Menggunakan 80% data untuk training+validasi, 20% untuk testing
-# validation_split=0.2 berarti 20% untuk 'validation' (testing), sisanya 80% untuk 'training'
-try:
-    train_val_ds = tf.keras.utils.image_dataset_from_directory(
-        DATASET_DIR,
-        label_mode='categorical',
-        validation_split=0.2,
-        subset="training",
-        seed=42,
-        image_size=IMG_SIZE,
-        batch_size=BATCH_SIZE
-    )
-
-    test_ds = tf.keras.utils.image_dataset_from_directory(
-        DATASET_DIR,
-        label_mode='categorical',
-        validation_split=0.2,
-        subset="validation",
-        seed=42,
-        image_size=IMG_SIZE,
-        batch_size=BATCH_SIZE
-    )
-except FileNotFoundError:
-    print(f"Error: Dataset directory not found at {DATASET_DIR}")
-    print("Silakan ganti placeholder 'DATASET_DIR' dengan path yang benar.")
-    exit()
-
-class_names = train_val_ds.class_names
-num_classes = len(class_names)
-print(f"Ditemukan {num_classes} kelas: {class_names}")
-
-# --- 3. MEMBUAT VALIDATION SPLIT (20% DARI DATA TRAINING) ---
-# Mengambil 20% dari train_val_ds untuk validasi
-# Dapatkan jumlah total batch sebagai Tensor int64
-cardinality = tf.data.experimental.cardinality(train_val_ds)
-
-# Ubah (cast) tensor int64 menjadi float32
-cardinality_float = tf.cast(cardinality, tf.float32)
-
-# Sekarang lakukan perkalian float * float (ini aman)
-val_size_float = cardinality_float * 0.2
-
-# Terakhir, ubah hasilnya kembali ke integer untuk .take()
-val_size = int(val_size_float)
-val_ds = train_val_ds.take(val_size)
-train_ds = train_val_ds.skip(val_size)
-
-print(f"Total batches (80%): {tf.data.experimental.cardinality(train_val_ds)}")
-print(f"Batches Training: {tf.data.experimental.cardinality(train_ds)}")
-print(f"Batches Validasi: {tf.data.experimental.cardinality(val_ds)}")
-print(f"Batches Testing (20%): {tf.data.experimental.cardinality(test_ds)}")
-
-# --- 4. OPTIMASI DATA PIPELINE ---
-AUTOTUNE = tf.data.AUTOTUNE
-train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
-val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
-test_ds = test_ds.prefetch(buffer_size=AUTOTUNE)
-
-# --- 5. AUGMENTASI DATA ---
-data_augmentation = keras.Sequential(
-    [
-        layers.RandomFlip("horizontal"),
-        
-        # PERBAIKAN: Gunakan height_factor dan width_factor 
-        # dengan rentang (-0.2, 0.0) untuk HANYA "zoom out"
-        layers.RandomZoom(height_factor=(-0.2, 0.0), width_factor=(-0.2, 0.0)),
-        
-        # PERBAIKAN: Ganti 'factor' dengan 'x_factor' dan 'y_factor'
-        layers.RandomShear(x_factor=0.2, y_factor=0.2),
-        
-        # Ini sudah benar, RandomRotation MENGGUNAKAN 'factor'
-        layers.RandomRotation(factor=0.2), 
-    ],
-    name="data_augmentation",
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    classification_report,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    roc_curve,
+    auc,
+    confusion_matrix
 )
+from sklearn.preprocessing import label_binarize
+from itertools import cycle
 
-# --- 6. MEMBANGUN MODEL (DENSENET) ---
-def build_densenet_model(num_classes):
-    # Load pre-trained DenseNet121
-    base_model = DenseNet121(
-        weights='imagenet',
-        include_top=False,  # Jangan include layer Fully Connected di atas
-        input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3)
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+
+# --- 1. KONFIGURASI & PARAMETER ---
+# Sesuaikan path ini dengan lokasi folder dataset Anda
+# Struktur folder yang diharapkan:
+# dataset_padang_food/
+#   ├── rendang/
+#   │   ├── img1.jpg
+#   │   └── ...
+#   ├── sate_padang/
+#   │   ├── img1.jpg
+#   │   └── ...
+#   └── ...
+DATASET_PATH = "dataset_padang_food"
+
+# Parameter Model
+IMG_HEIGHT = 224
+IMG_WIDTH = 224
+IMG_SHAPE = (IMG_HEIGHT, IMG_WIDTH, 3)
+BATCH_SIZE = 32
+EPOCHS = 10  # Tambah jumlah epochs untuk hasil yang lebih baik
+LEARNING_RATE = 0.001
+
+
+def load_and_split_data(base_path):
+    """
+    Memuat path file, melakukan splitting data 80-20 (train_val-test)
+    dan 80-20 (train-val) dari set train_val.
+    Menggunakan stratify untuk menjaga proporsi kelas.
+    """
+    print(f"Membaca dataset dari: {base_path}")
+    
+    # Cari semua file gambar dengan ekstensi umum
+    image_pattern = os.path.join(base_path, '*/*')
+    allowed_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
+    filepaths = []
+    
+    # Glob tidak case-insensitive, jadi kita cek manual
+    for ext in allowed_extensions:
+        filepaths.extend(glob.glob(image_pattern + ext))
+        filepaths.extend(glob.glob(image_pattern + ext.upper()))
+
+    if not filepaths:
+        print(f"Error: Tidak ada file gambar ditemukan di {base_path}")
+        print("Pastikan struktur folder Anda benar (cth: dataset_padang_food/nama_kelas/gambar.jpg)")
+        return None, None, None, 0, []
+
+    # Buat DataFrame untuk manajemen data yang mudah
+    data = []
+    for fp in filepaths:
+        try:
+            label = os.path.basename(os.path.dirname(fp))
+            data.append({'filepath': fp, 'label': label})
+        except Exception as e:
+            print(f"Gagal memproses file {fp}: {e}")
+
+    df = pd.DataFrame(data)
+
+    if df.empty:
+        print("Error: DataFrame kosong, tidak ada data yang berhasil diproses.")
+        return None, None, None, 0, []
+
+    print(f"\nTotal gambar ditemukan: {len(df)}")
+    print("Distribusi kelas (sebelum split):")
+    print(df['label'].value_counts())
+
+    class_names = sorted(df['label'].unique())
+    num_classes = len(class_names)
+
+    if num_classes < 2:
+        print(f"Error: Hanya ditemukan {num_classes} kelas. Dibutuhkan minimal 2 kelas untuk klasifikasi.")
+        return None, None, None, 0, []
+
+    # Split 1: 80% Training-Validasi, 20% Testing
+    train_val_df, test_df = train_test_split(
+        df,
+        test_size=0.20,
+        random_state=42,
+        stratify=df['label']
     )
 
-    # Bekukan (freeze) layer dari base model
-    base_model.trainable = False
+    # Split 2: 80% Training, 20% Validasi (dari set train_val_df)
+    train_df, val_df = train_test_split(
+        train_val_df,
+        test_size=0.20,  # 0.20 dari 80% = 16% dari total
+        random_state=42,
+        stratify=train_val_df['label']
+    )
+    
+    # 80% dari 80% = 64% dari total
+    print(f"\nTotal data Training   : {len(train_df)} (64%)")
+    print(f"Total data Validasi : {len(val_df)} (16%)")
+    print(f"Total data Testing    : {len(test_df)} (20%)")
+    
+    return train_df, val_df, test_df, num_classes, class_names
 
-    # Buat model baru
-    inputs = keras.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+
+def create_generators(train_df, val_df, test_df, class_names):
+    """
+    Membuat Keras ImageDataGenerators dari DataFrames.
+    """
+    print("\nMembuat Data Generators...")
     
-    # Terapkan augmentasi
-    x = data_augmentation(inputs)
+    # Augmentasi untuk data training
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        horizontal_flip=True,
+        zoom_range=0.2,       # Zoom out
+        shear_range=0.2,
+        rotation_range=20     # Rotasi 0.2 radian ~ 11.4 derajat. 20 derajat lebih umum.
+    )
     
-    # Preprocessing input (penting untuk model pre-trained)
-    x = tf.keras.applications.densenet.preprocess_input(x)
+    # TIDAK ADA augmentasi untuk validasi dan testing, hanya rescale
+    test_val_datagen = ImageDataGenerator(rescale=1./255)
+
+    target_size = (IMG_HEIGHT, IMG_WIDTH)
+
+    # Generator untuk Training
+    train_generator = train_datagen.flow_from_dataframe(
+        dataframe=train_df,
+        x_col='filepath',
+        y_col='label',
+        target_size=target_size,
+        batch_size=BATCH_SIZE,
+        class_mode='categorical',
+        classes=class_names, # Pastikan urutan kelas konsisten
+        shuffle=True
+    )
+
+    # Generator untuk Validasi
+    validation_generator = test_val_datagen.flow_from_dataframe(
+        dataframe=val_df,
+        x_col='filepath',
+        y_col='label',
+        target_size=target_size,
+        batch_size=BATCH_SIZE,
+        class_mode='categorical',
+        classes=class_names,
+        shuffle=False
+    )
+
+    # Generator untuk Testing
+    test_generator = test_val_datagen.flow_from_dataframe(
+        dataframe=test_df,
+        x_col='filepath',
+        y_col='label',
+        target_size=target_size,
+        batch_size=BATCH_SIZE,
+        class_mode='categorical',
+        classes=class_names,
+        shuffle=False  # PENTING: Jangan shuffle test data untuk evaluasi
+    )
     
-    # Lewatkan ke base model
-    # training=False penting karena kita membekukan layer
-    x = base_model(x, training=False)
+    return train_generator, validation_generator, test_generator
+
+
+def build_model(num_classes):
+    """
+    Membangun model DenseNet121 untuk transfer learning.
+    """
+    print("\nMembangun model DenseNet121...")
     
-    # Tambahkan head kustom kita
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(1024, activation='relu')(x)
-    x = layers.Dropout(0.5)(x)  # Dropout untuk regularisasi
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    # Muat base model DenseNet121, pre-trained di ImageNet
+    base_model = DenseNet121(
+        weights='imagenet', 
+        include_top=False,  # Buang layer klasifikasi asli
+        input_shape=IMG_SHAPE
+    )
     
-    model = keras.Model(inputs, outputs)
+    # Bekukan bobot base model agar tidak ikut terlatih
+    base_model.trainable = False
+    
+    # Tambahkan layer kustom di atas base model
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)  # Konversi fitur menjadi 1D vektor
+    x = Dense(1024, activation='relu')(x) # Layer fully connected
+    # Layer output (softmax untuk multi-kelas)
+    predictions = Dense(num_classes, activation='softmax')(x)
+    
+    model = Model(inputs=base_model.input, outputs=predictions)
+    
+    # Compile model
+    optimizer = Adam(learning_rate=LEARNING_RATE)
+    model.compile(
+        optimizer=optimizer,
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    print("Model berhasil dibangun.")
     return model
 
-model = build_densenet_model(num_classes)
-model.summary()
 
-# --- 7. KOMPILASI MODEL ---
-model.compile(
-    optimizer=keras.optimizers.Adam(),
-    loss='categorical_crossentropy',
-    metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
-)
+def plot_history(history):
+    """
+    Membuat plot akurasi dan loss training/validasi.
+    """
+    plt.figure(figsize=(12, 6))
 
-# --- 8. MELATIH MODEL ---
-print("\n--- Memulai Training ---")
-start_train_time = time.time()
+    # Plot Akurasi
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.title('Akurasi Training vs Validasi')
+    plt.xlabel('Epoch')
+    plt.ylabel('Akurasi')
+    plt.legend(loc='lower right')
 
-history = model.fit(
-    train_ds,
-    epochs=EPOCHS,
-    validation_data=val_ds
-)
+    # Plot Loss
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Loss Training vs Validasi')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend(loc='upper right')
 
-end_train_time = time.time()
-training_time = end_train_time - start_train_time
-
-# --- TAMBAHKAN BLOK KODE PLOTTING DI SINI ---
-acc = history.history['accuracy']
-val_acc = history.history['val_accuracy']
-loss = history.history['loss']
-val_loss = history.history['val_loss']
-
-# Dapatkan jumlah epoch yang sebenarnya dijalankan
-epochs_range = range(len(acc))
-
-plt.figure(figsize=(14, 6)) # Atur ukuran gambar
-
-# Plot untuk Akurasi
-plt.subplot(1, 2, 1) # 1 baris, 2 kolom, plot ke-1
-plt.plot(epochs_range, acc, label='Train')
-plt.plot(epochs_range, val_acc, label='Validation')
-plt.legend(loc='upper left')
-plt.title('Model Accuracy')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
-
-# Plot untuk Loss
-plt.subplot(1, 2, 2) # 1 baris, 2 kolom, plot ke-2
-plt.plot(epochs_range, loss, label='Train')
-plt.plot(epochs_range, val_loss, label='Validation')
-plt.legend(loc='upper left')
-plt.title('Model Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-
-# Tampilkan kedua plot
-plt.show()
-# ---------------------------------------------
-
-print(f"--- Training Selesai ---")
+    plt.tight_layout()
+    plt.show()
 
 
-# --- 9. EVALUASI MODEL ---
-print("\n--- Memulai Testing (Evaluasi) ---")
-y_pred_probs = []
-y_test_labels = []
+def plot_roc_auc(y_true, y_pred_proba, num_classes, class_labels):
+    """
+    Menghitung dan memplot Kurva ROC untuk setiap kelas (One-vs-Rest).
+    """
+    print("\nMembuat plot ROC/AUC...")
+    
+    # Binarize label asli
+    y_true_bin = label_binarize(y_true, classes=range(num_classes))
 
-start_test_time = time.time()
+    # Hitung ROC curve dan ROC area untuk setiap kelas
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    for i in range(num_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_pred_proba[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
 
-# Menggunakan model.predict() untuk efisiensi
-# Ini mengukur waktu inferensi (testing) murni
-y_pred_probs = model.predict(test_ds)
+    # Plot ROC curve
+    plt.figure(figsize=(10, 8))
+    colors = cycle(['aqua', 'darkorange', 'cornflowerblue', 'green', 'red', 'purple', 'brown', 'pink', 'gray', 'olive'])
+    
+    for i, color, label in zip(range(num_classes), colors, class_labels):
+        plt.plot(fpr[i], tpr[i], color=color, lw=2,
+                 label='ROC curve (area = {1:0.2f}) untuk kelas {0}'
+                 ''.format(label, roc_auc[i]))
 
-end_test_time = time.time()
-testing_time = end_test_time - start_test_time
-
-# Kumpulkan label asli dari test_ds
-for _, labels in test_ds.unbatch():
-    y_test_labels.append(labels.numpy())
-
-y_test_labels = np.array(y_test_labels)
-
-# Konversi probabilitas (softmax) ke label kelas (argmax)
-y_pred_labels = np.argmax(y_pred_probs, axis=1)
-y_test_labels_indices = np.argmax(y_test_labels, axis=1) # Konversi dari one-hot ke index
-
-print(f"--- Testing Selesai ---")
-
-# --- 10. MENGHITUNG METRIK ---
-print("\n--- Hasil Evaluasi ---")
-
-# a. Akurasi
-accuracy = accuracy_score(y_test_labels_indices, y_pred_labels)
-
-# b. Presisi, Recall, F1-Score (Gunakan 'weighted' untuk multi-class)
-precision = precision_score(y_test_labels_indices, y_pred_labels, average='weighted', zero_division=0)
-recall = recall_score(y_test_labels_indices, y_pred_labels, average='weighted', zero_division=0)
-f1 = f1_score(y_test_labels_indices, y_pred_labels, average='weighted', zero_division=0)
-
-# c. ROC/AUC (Gunakan 'ovr' - One-vs-Rest untuk multi-class)
-# y_test_labels (sudah one-hot) vs y_pred_probs (probabilitas)
-try:
-    roc_auc = roc_auc_score(y_test_labels, y_pred_probs, multi_class='ovr', average='weighted')
-except ValueError as e:
-    roc_auc = f"Tidak dapat dihitung (mungkin hanya ada 1 sampel per kelas): {e}"
-
-# d. Computation Time
-# Sudah dihitung: training_time dan testing_time
-
-# --- 11. MENAMPILKAN HASIL ---
-print("\n\n========================================================")
-print("           LAPORAN EVALUASI AKHIR MODEL")
-print("========================================================")
-print(f"Model                 : DenseNet121 (Transfer Learning)")
-print(f"Total Epochs          : {EPOCHS}")
-print("-" * 56)
-
-print("\n📊 HASIL PERFORMA KESELURUHAN (Weighted Average)")
-print(f"Akurasi               : {accuracy:.4f}")
-print(f"Presisi (Weighted)    : {precision:.4f}")
-print(f"Recall (Weighted)     : {recall:.4f}")
-print(f"F1-Score (Weighted)   : {f1:.4f}")
-print(f"ROC/AUC (Weighted)    : {roc_auc if isinstance(roc_auc, str) else f'{roc_auc:.4f}'}")
-print("-" * 56)
-
-print("\n⏱️ WAKTU KOMPUTASI")
-print(f"Waktu Training        : {training_time:.2f} detik")
-print(f"Waktu Testing         : {testing_time:.2f} detik")
-print("=" * 56)
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Kurva ROC Multi-Kelas (One-vs-Rest)')
+    plt.legend(loc="lower right", prop={'size': 10})
+    plt.show()
 
 
-print("\n\n--- Classification Report (Rincian per Kelas) ---")
-# Menghitung dan mencetak laporan klasifikasi
-report = classification_report(y_test_labels_indices, 
-                               y_pred_labels, 
-                               target_names=class_names, 
-                               zero_division=0)
-print(report)
-print("-" * 56)
+def main():
+    """
+    Fungsi utama untuk menjalankan seluruh pipeline.
+    """
+    total_start_time = time.time()
+    
+    # 1. Muat dan Pisahkan Data
+    train_df, val_df, test_df, num_classes, class_names = load_and_split_data(DATASET_PATH)
+    
+    if train_df is None:
+        return  # Hentikan eksekusi jika data gagal dimuat
+
+    # 2. Buat Generator
+    train_generator, validation_generator, test_generator = create_generators(
+        train_df, val_df, test_df, class_names
+    )
+
+    # 3. Bangun Model
+    model = build_model(num_classes)
+    model.summary()
+
+    # 4. Latih Model
+    print("\n--- Memulai Pelatihan Model ---")
+    start_train_time = time.time()
+    
+    history = model.fit(
+        train_generator,
+        epochs=EPOCHS,
+        validation_data=validation_generator,
+        steps_per_epoch=len(train_generator),
+        validation_steps=len(validation_generator),
+        verbose=1
+    )
+    
+    end_train_time = time.time()
+    training_time = end_train_time - start_train_time
+    print(f"--- Pelatihan Selesai (Durasi: {training_time:.2f} detik) ---")
+
+    # 5. Evaluasi Model
+    print("\n--- Memulai Evaluasi Model pada Data Test ---")
+    start_test_time = time.time()
+
+    # Dapatkan probabilitas prediksi
+    # steps=None memastikan semua data test diprediksi
+    y_pred_proba = model.predict(test_generator, steps=None, verbose=1) 
+    
+    # Konversi probabilitas ke label kelas
+    y_pred = np.argmax(y_pred_proba, axis=1)
+    
+    # Dapatkan label asli (ground truth)
+    y_true = test_generator.classes
+    
+    end_test_time = time.time()
+    testing_time = end_test_time - start_test_time
+    print(f"--- Evaluasi Selesai (Durasi: {testing_time:.2f} detik) ---")
+
+    # 6. Tampilkan Hasil Evaluasi
+    print("\n=============================================")
+    print("           HASIL EVALUASI MODEL          ")
+    print("=============================================")
+
+    # Hitung Metrik
+    accuracy = accuracy_score(y_true, y_pred)
+    # 'macro' menghitung metrik untuk setiap kelas, lalu mengambil rata-rata
+    precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    # 'ovr' (One-vs-Rest) diperlukan untuk ROC/AUC multi-kelas
+    try:
+        y_true_bin_for_auc = label_binarize(y_true, classes=range(num_classes))
+        roc_auc_macro = roc_auc_score(y_true_bin_for_auc, y_pred_proba, average='macro', multi_class='ovr')
+    except ValueError as e:
+        print(f"Peringatan: Gagal menghitung ROC AUC: {e}")
+        roc_auc_macro = 0.0
 
 
-print("\n--- Menampilkan Visualisasi Confusion Matrix ---")
-cm = confusion_matrix(y_test_labels_indices, y_pred_labels)
+    print("\n--- Metrik Keseluruhan (Macro-Average) ---")
+    print(f"Akurasi    : {accuracy * 100:.2f} %")
+    print(f"Presisi    : {precision * 100:.2f} %")
+    print(f"Recall     : {recall * 100:.2f} %")
+    print(f"F1 Score   : {f1 * 100:.2f} %")
+    print(f"ROC/AUC    : {roc_auc_macro * 100:.2f} %")
 
-# Membuat visualisasi heatmap
-plt.figure(figsize=(12, 10))
-sns.heatmap(cm, 
-            annot=True,     # Menampilkan angka di dalam kotak
-            fmt='d',        # Format angka sebagai integer
-            cmap='Blues',   # Skema warna
-            xticklabels=class_names, 
-            yticklabels=class_names)
+    print("\n--- Laporan Klasifikasi (Per Kelas) ---")
+    print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
 
-plt.title('Confusion Matrix', fontsize=16)
-plt.ylabel('True label', fontsize=12)
-plt.xlabel('Predicted label', fontsize=12)
-plt.xticks(rotation=45, ha='right')
-plt.yticks(rotation=0)
-plt.tight_layout()
-plt.show() # Menampilkan plot
+    # 7. Tampilkan Waktu Komputasi
+    total_end_time = time.time()
+    total_computation_time = total_end_time - total_start_time
+    # total_computation_time_alt = training_time + testing_time 
+    # (Hampir sama, tapi total_start_time mencakup pemrosesan data)
 
-print(f"\nLabel Kelas: {list(enumerate(class_names))}")
+    print("\n--- Waktu Komputasi ---")
+    print(f"Waktu Pelatihan (Training) : {training_time:.2f} detik")
+    print(f"Waktu Pengujian (Testing)  : {testing_time:.2f} detik")
+    print(f"Total Waktu (dari awal)    : {total_computation_time:.2f} detik")
+    
+    # 8. Tampilkan Plot
+    print("\nMenampilkan plot...")
+    plot_history(history)
+    plot_roc_auc(y_true, y_pred_proba, num_classes, class_names)
+    
+    # Plot Confusion Matrix
+    print("Menampilkan Confusion Matrix...")
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title('Confusion Matrix')
+    plt.ylabel('Label Asli (True)')
+    plt.xlabel('Label Prediksi')
+    plt.show()
+
+
+# Menjalankan skrip utama
+if __name__ == "__main__":
+    # Pastikan TensorFlow menggunakan GPU jika tersedia
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Saat ini, set memory growth dibutuhkan untuk menghindari error CUDA
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+            print(f"{len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs ditemukan.")
+        except RuntimeError as e:
+            print(e)
+    else:
+        print("Tidak ada GPU ditemukan, menggunakan CPU.")
+
+    main()
