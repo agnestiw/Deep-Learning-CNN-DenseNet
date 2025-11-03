@@ -360,11 +360,11 @@ def main():
 
 
     print("\n--- Metrik Keseluruhan (Macro-Average) ---")
-    print(f"Akurasi    : {accuracy * 100:.2f} %")
-    print(f"Presisi    : {precision * 100:.2f} %")
-    print(f"Recall     : {recall * 100:.2f} %")
-    print(f"F1 Score   : {f1 * 100:.2f} %")
-    print(f"ROC/AUC    : {roc_auc_macro * 100:.2f} %")
+    print(f"Akurasi    : {accuracy:.4f} ({accuracy * 100:.2f} %)")
+    print(f"Presisi    : {precision:.4f} ({precision * 100:.2f} %)")
+    print(f"Recall     : {recall:.4f} ({recall * 100:.2f} %)")
+    print(f"F1 Score   : {f1:.4f} ({f1 * 100:.2f} %)")
+    print(f"ROC/AUC    : {roc_auc_macro:.4f} ({roc_auc_macro * 100:.2f} %)")
 
     print("\n--- Laporan Klasifikasi (Per Kelas) ---")
     print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
